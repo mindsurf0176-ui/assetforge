@@ -510,7 +510,7 @@ assetforge clip-run status --run build/moa-clip-run
 assetforge clip-run accept --run build/moa-clip-run --job walk --frame 3 --source decoded/walk-03.png
 ```
 
-Passing `clip-run` inspection does not ingest, release, or connect Starline. Use `source-sheet` / `ingest` / `validate` on approved frames only.
+Passing `clip-run` inspection does not ingest, release, or connect Starline. Cloned holds, collapsed silhouettes, and loop foot-line drift fail before ingest. Use `source-sheet` / `ingest` / `validate` on approved frames only. The AssetForge MCP tools `prepare_clip_run`, `accept_clip_run`, and `repair_clip_run` wrap the same graph.
 
 ## Ingest a generated source sheet with a fixed motion anchor
 

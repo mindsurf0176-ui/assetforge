@@ -22,21 +22,35 @@ from assetforge.clip_run import (
 from assetforge.tests.test_release import _profile
 
 
-def _blob(path: Path, color: tuple[int, int, int] = (180, 140, 110), size: int = 20) -> Path:
+def _blob(path: Path, color: tuple[int, int, int] = (180, 140, 110), size: int = 20, dx: int = 0) -> Path:
     image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
-    draw.rectangle((4, 6, size - 5, size - 3), fill=(*color, 255))
+    draw.rectangle((4 + dx, 6, size - 5 + dx, size - 3), fill=(*color, 255))
     path.parent.mkdir(parents=True, exist_ok=True)
     image.save(path)
     return path
 
 
-def _sheet(path: Path, color: tuple[int, int, int] = (180, 140, 110), frames: int = 2, size: int = 20) -> Path:
+def _sheet(
+    path: Path,
+    color: tuple[int, int, int] = (180, 140, 110),
+    frames: int = 2,
+    size: int = 20,
+    *,
+    vary: bool = True,
+    y_shift: int = 0,
+    scale: int = 1,
+) -> Path:
     image = Image.new("RGBA", (size * frames, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
     for index in range(frames):
         left = index * size
-        draw.rectangle((left + 4, 6, left + size - 5, size - 3), fill=(*color, 255))
+        dx = index * 2 if vary else 0
+        inset = 4 if scale == 1 else size // 2 - 1
+        draw.rectangle(
+            (left + inset + dx, 6 + y_shift, left + size - inset - 1 + dx, size - 3 + y_shift),
+            fill=(*color, 255),
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     image.save(path)
     return path
@@ -140,7 +154,7 @@ class ClipRunTests(unittest.TestCase):
             repaired = accept_job(
                 manifest,
                 "walk",
-                source=_blob(root / "walk-1-fixed.png"),
+                source=_blob(root / "walk-1-fixed.png", dx=2),
                 frame=1,
             )
             self.assertTrue(repaired["ok"], repaired)
@@ -247,6 +261,60 @@ class ClipRunTests(unittest.TestCase):
             self.assertEqual(payload["readyJobs"], ["idle"])
             status = clip_run_status(root / "cli-run")
             self.assertEqual(status["readyJobs"], ["idle"])
+
+    def test_duplicate_walk_holds_fail_before_ingest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            profile = _profile(root)
+            prepared = prepare_clip_run(
+                profile,
+                character="demo",
+                tier="runtime",
+                direction="east",
+                output=root / "run",
+                reference=_blob(root / "identity.png"),
+                lock_reference=True,
+            )
+            manifest = load_clip_run(prepared["run"])
+            self.assertTrue(accept_job(manifest, "idle", source=_sheet(root / "idle.png"))["ok"])
+            cloned = accept_job(
+                manifest,
+                "walk",
+                source=_sheet(root / "walk-clone.png", vary=False),
+            )
+            self.assertFalse(cloned["ok"], cloned)
+            self.assertTrue(any("duplicate holds" in error for error in cloned["errors"]))
+
+    def test_missing_mass_and_foot_drift_fail_identity_and_loop_gates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            profile = _profile(root)
+            prepared = prepare_clip_run(
+                profile,
+                character="demo",
+                tier="runtime",
+                direction="east",
+                output=root / "run",
+                reference=_blob(root / "identity.png"),
+                lock_reference=True,
+            )
+            tiny = Image.new("RGBA", (20, 20), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(tiny)
+            draw.rectangle((8, 8, 10, 10), fill=(180, 140, 110, 255))
+            identity = inspect_identity(tiny, Image.open(root / "identity.png").convert("RGBA"), clip="walk")
+            self.assertTrue(any("occupancy" in error or "bbox ratio" in error for error in identity["errors"]), identity)
+            manifest = load_clip_run(prepared["run"])
+            self.assertTrue(accept_job(manifest, "idle", source=_sheet(root / "idle.png"))["ok"])
+            floating = Image.new("RGBA", (40, 20), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(floating)
+            draw.rectangle((4, 6, 15, 17), fill=(180, 140, 110, 255))
+            draw.rectangle((26, 1, 37, 10), fill=(180, 140, 110, 255))
+            float_path = root / "walk-float.png"
+            floating.save(float_path)
+            drifted = accept_job(manifest, "walk", source=float_path)
+            self.assertFalse(drifted["ok"], drifted)
+            self.assertTrue(any("foot-line" in error for error in drifted["errors"]), drifted)
+
 
 
 if __name__ == "__main__":

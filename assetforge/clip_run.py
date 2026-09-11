@@ -50,7 +50,16 @@ GUIDE_BACKGROUND_RATIO_LIMIT = 0.01
 GUIDE_MARK_PIXEL_LIMIT = 40
 IDENTITY_MIN_PALETTE_OVERLAP = 0.42
 IDENTITY_MIN_COLOR_SIMILARITY = 0.72
+IDENTITY_MIN_MASK_IOU = 0.32
+IDENTITY_MIN_OCCUPANCY = 0.55
+IDENTITY_MAX_OCCUPANCY = 1.55
+IDENTITY_MIN_BBOX_RATIO = 0.55
+UNIQUE_POSE_MAX_IOU = 0.97
+IDLE_CLONE_MAX_IOU = 0.995
+FOOT_DRIFT_RATIO = 0.08
+FOOT_DRIFT_MIN_PX = 2
 MIN_FOREGROUND_PIXELS = 16
+LOOP_CLIPS = {"idle", "walk", "aim"}
 
 
 def _utc_now() -> str:
@@ -290,6 +299,34 @@ def _mean_color(rgb: np.ndarray) -> np.ndarray:
     return rgb.astype(np.float32).mean(axis=0)
 
 
+
+def _alpha_mask(image: Image.Image, min_alpha: int = 20) -> np.ndarray:
+    return np.asarray(image.convert("RGBA"), dtype=np.uint8)[:, :, 3] > min_alpha
+
+
+def _resize_mask(mask: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    width, height = size
+    if mask.shape == (height, width):
+        return mask
+    image = Image.fromarray(mask.astype(np.uint8) * 255, mode="L")
+    resized = image.resize((width, height), Image.Resampling.NEAREST)
+    return np.asarray(resized) > 127
+
+
+def _mask_iou(left: np.ndarray, right: np.ndarray) -> float:
+    union = int(np.logical_or(left, right).sum())
+    if union == 0:
+        return 1.0
+    return float(np.logical_and(left, right).sum() / union)
+
+
+def _mask_bbox(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
 def inspect_guide_pixels(image: Image.Image) -> dict[str, Any]:
     rgb = np.asarray(image.convert("RGB"), dtype=np.float32)
     total = int(rgb.shape[0] * rgb.shape[1])
@@ -322,6 +359,20 @@ def inspect_identity(frame: Image.Image, canonical: Image.Image, *, clip: str) -
     overlap = _palette_overlap(frame_palette, canonical_palette)
     color_distance = float(np.linalg.norm(_mean_color(frame_rgb) - _mean_color(canonical_rgb)))
     color_similarity = max(0.0, 1.0 - color_distance / math.sqrt(3.0 * 255.0**2))
+    canonical_mask = _alpha_mask(canonical)
+    frame_mask = _resize_mask(_alpha_mask(frame), canonical.size)
+    silhouette_iou = _mask_iou(frame_mask, canonical_mask)
+    canonical_pixels = int(canonical_mask.sum())
+    occupancy = (int(frame_mask.sum()) / canonical_pixels) if canonical_pixels else 0.0
+    frame_box = _mask_bbox(frame_mask)
+    canonical_box = _mask_bbox(canonical_mask)
+    bbox_ratio = 0.0
+    if frame_box and canonical_box:
+        frame_w = max(1, frame_box[2] - frame_box[0])
+        frame_h = max(1, frame_box[3] - frame_box[1])
+        canon_w = max(1, canonical_box[2] - canonical_box[0])
+        canon_h = max(1, canonical_box[3] - canonical_box[1])
+        bbox_ratio = min(frame_w / canon_w, frame_h / canon_h)
     errors: list[str] = []
     if len(frame_rgb) < MIN_FOREGROUND_PIXELS:
         errors.append("frame has no usable foreground against the canonical identity")
@@ -335,9 +386,26 @@ def inspect_identity(frame: Image.Image, canonical: Image.Image, *, clip: str) -
             f"{clip} mean-color similarity {color_similarity:.3f} is below "
             f"{IDENTITY_MIN_COLOR_SIMILARITY:.2f}"
         )
+    if silhouette_iou < IDENTITY_MIN_MASK_IOU:
+        errors.append(
+            f"{clip} silhouette IoU {silhouette_iou:.3f} is below {IDENTITY_MIN_MASK_IOU:.2f}"
+        )
+    if occupancy < IDENTITY_MIN_OCCUPANCY or occupancy > IDENTITY_MAX_OCCUPANCY:
+        errors.append(
+            f"{clip} occupancy {occupancy:.3f} is outside "
+            f"{IDENTITY_MIN_OCCUPANCY:.2f}..{IDENTITY_MAX_OCCUPANCY:.2f}"
+        )
+    if bbox_ratio < IDENTITY_MIN_BBOX_RATIO:
+        errors.append(
+            f"{clip} bbox ratio {bbox_ratio:.3f} is below {IDENTITY_MIN_BBOX_RATIO:.2f}; "
+            "missing mass or equipment is a blocker"
+        )
     return {
         "paletteOverlap": round(overlap, 4),
         "colorSimilarity": round(color_similarity, 4),
+        "silhouetteIoU": round(silhouette_iou, 4),
+        "occupancy": round(occupancy, 4),
+        "bboxRatio": round(bbox_ratio, 4),
         "foregroundPixels": int(len(frame_rgb)),
         "errors": errors,
     }
@@ -602,6 +670,11 @@ def prepare_clip_run(
         "identity": {
             "minPaletteOverlap": IDENTITY_MIN_PALETTE_OVERLAP,
             "minColorSimilarity": IDENTITY_MIN_COLOR_SIMILARITY,
+            "minMaskIoU": IDENTITY_MIN_MASK_IOU,
+            "minOccupancy": IDENTITY_MIN_OCCUPANCY,
+            "maxOccupancy": IDENTITY_MAX_OCCUPANCY,
+            "minBboxRatio": IDENTITY_MIN_BBOX_RATIO,
+            "uniquePoseMaxIoU": UNIQUE_POSE_MAX_IOU,
             "driftIsBlocker": True,
         },
         "workerProtocol": {
@@ -653,19 +726,28 @@ def _inspect_clip_frames(
     frames: list[Path],
     canonical: Image.Image,
     clip: str,
+    *,
+    loop: bool,
 ) -> dict[str, Any]:
     reports = []
     errors: list[str] = []
     failed_frames: list[int] = []
-    for index, path in enumerate(frames):
+    opened_frames: list[Image.Image] = []
+    masks: list[np.ndarray] = []
+    feet: list[int] = []
+    for path in frames:
         with Image.open(path) as opened:
             frame = opened.convert("RGBA")
+        opened_frames.append(frame)
+        mask = _alpha_mask(frame)
+        masks.append(mask)
+        box = _mask_bbox(mask)
+        if box is not None:
+            feet.append(box[3] - 1)
+    for index, (path, frame) in enumerate(zip(frames, opened_frames)):
         guide = inspect_guide_pixels(frame)
         identity = inspect_identity(frame, canonical, clip=clip)
         frame_errors = list(guide["errors"]) + list(identity["errors"])
-        if frame_errors:
-            failed_frames.append(index)
-            errors.extend(f"{clip} frame {index}: {message}" for message in frame_errors)
         reports.append(
             {
                 "index": index,
@@ -675,10 +757,44 @@ def _inspect_clip_frames(
                 "errors": frame_errors,
             }
         )
+    if len(masks) >= 2:
+        pairwise: list[float] = []
+        for left in range(len(masks)):
+            for right in range(left + 1, len(masks)):
+                iou = _mask_iou(masks[left], masks[right])
+                pairwise.append(iou)
+                limit = IDLE_CLONE_MAX_IOU if clip == "idle" else UNIQUE_POSE_MAX_IOU
+                if iou >= limit:
+                    message = (
+                        f"{clip} frames {left} and {right} are duplicate holds "
+                        f"(mask IoU {iou:.3f})"
+                    )
+                    errors.append(message)
+                    reports[left]["errors"].append(message)
+                    reports[right]["errors"].append(message)
+        if clip == "idle" and pairwise and min(pairwise) >= IDLE_CLONE_MAX_IOU:
+            errors.append(f"{clip} is a cloned hold; unique breathing poses are required")
+    if loop and len(feet) >= 2:
+        drift = max(feet) - min(feet)
+        limit = max(FOOT_DRIFT_MIN_PX, int(round(canonical.size[1] * FOOT_DRIFT_RATIO)))
+        if drift > limit:
+            message = f"{clip} foot-line drift {drift}px exceeds {limit}px"
+            errors.append(message)
+            for report in reports:
+                report["errors"].append(message)
+    for report in reports:
+        if report["errors"]:
+            failed_frames.append(int(report["index"]))
+            errors.extend(
+                f"{clip} frame {report['index']}: {message}"
+                for message in report["errors"]
+                if not str(message).startswith(f"{clip} frame ")
+            )
     return {
         "frames": reports,
-        "failedFrames": failed_frames,
-        "errors": errors,
+        "failedFrames": list(dict.fromkeys(failed_frames)),
+        "errors": list(dict.fromkeys(errors)),
+        "footY": feet,
     }
 
 
@@ -732,7 +848,14 @@ def inspect_job(manifest: dict[str, Any], job_id: str) -> dict[str, Any]:
         )
     with Image.open(canonical_path) as opened:
         canonical = opened.convert("RGBA")
-    clip_report = _inspect_clip_frames(frame_paths, canonical, str(job["clip"]))
+    loop = bool((job.get("contract") or {}).get("loop", job.get("clip") in LOOP_CLIPS))
+    clip_report = _inspect_clip_frames(
+        frame_paths,
+        canonical,
+        str(job["clip"]),
+        loop=loop,
+    )
+    result["footY"] = clip_report.get("footY", [])
     errors.extend(clip_report["errors"])
     result["frames"] = clip_report["frames"]
     result["failedFrames"] = clip_report["failedFrames"]
@@ -904,8 +1027,16 @@ def accept_job(
 
 def _identity_error(errors: list[str]) -> bool:
     return any(
-        "identity" in error or "palette overlap" in error or "color similarity" in error
+        token in error
         for error in errors
+        for token in (
+            "identity",
+            "palette overlap",
+            "color similarity",
+            "silhouette IoU",
+            "occupancy",
+            "bbox ratio",
+        )
     )
 
 
