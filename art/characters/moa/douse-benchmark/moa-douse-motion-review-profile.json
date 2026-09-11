@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "id": "moa-douse-motion-review",
+  "kind": "pixel-character",
+  "projectRoot": ".",
+  "directions": ["east"],
+  "tiers": {
+    "battle-candidate": {
+      "canvas": [360, 360],
+      "canvasPolicy": "fixed",
+      "anchor": [180, 352],
+      "contentMin": [16, 16],
+      "contentMax": [354, 342],
+      "padding": 3,
+      "preservePlacement": true,
+      "allowUpscale": false,
+      "filtering": "nearest",
+      "downscaleFiltering": "nearest",
+      "previewScale": 3
+    }
+  },
+  "quality": {
+    "alphaThreshold": 20,
+    "palette": {"maxColors": 64, "lockAcrossClip": true},
+    "background": {
+      "mode": "transparent-or-corner",
+      "tolerance": 42,
+      "maxRepairableEnclosedComponentPixels": 0,
+      "maxEnclosedTransparentPixels": 1200
+    },
+    "anchor": {"type": "bottom-center", "maxFootDrift": 2},
+    "edgeMatte": {"mode": "remove-neutral", "minRgb": 190, "maxChannelSpread": 42, "maxLayers": 2, "maxPixels": 96},
+    "identity": {"maxHeightDriftRatio": 0.15, "maxWidthDriftRatio": 0.5}
+  },
+  "animations": {
+    "walk": {"minFrames": 8, "maxFrames": 8, "fps": 12, "loop": true, "identity": {"maxHeightDriftRatio": 0.15, "maxWidthDriftRatio": 0.5}}
+  },
+  "export": {"engine": "godot", "format": "spriteframes", "resourcePrefix": "res://assets/sprites/moa_pl"}
+}

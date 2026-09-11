@@ -56,6 +56,17 @@ from .redraw_delivery import evaluate_redraw_holdout_batch, export_redraw_board_
 from .redraw_quality import evaluate_redraw_sample
 from .release import package_release, verify_release
 from .single_image import build_single_image_animation
+from .auto_decompose import auto_decompose
+from .vision_import import stage_vision_layers
+from .multi_consensus import multi_consensus
+from .clip_run import (
+    accept_job,
+    clip_run_status,
+    inspect_clip_run,
+    load_clip_run,
+    prepare_clip_run,
+    repair_plan,
+)
 
 
 def emit(value: Any) -> None:
@@ -150,6 +161,76 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--minimum-free-gib", type=float, default=6.0)
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--execute", action="store_true", help="run MFLUX after planning; requires a ready local model")
+
+    p = sub.add_parser("multi-consensus", help="analyze stable motion regions across existing frames")
+    p.add_argument("--frames", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--clip", help="only analyze one clip prefix, for example walk")
+    p.add_argument("--change-threshold", type=int, default=24)
+    p.add_argument("--min-component", type=int, default=8)
+
+    p = sub.add_parser(
+        "clip-run",
+        help="lock a canonical identity, then open per-clip generation jobs",
+    )
+    clip_run = p.add_subparsers(dest="clip_run_command", required=True)
+    prep = clip_run.add_parser("prepare", help="create layout guides, prompts, and a job DAG")
+    prep.add_argument("--profile", required=True)
+    prep.add_argument("--character", required=True)
+    prep.add_argument("--tier", required=True)
+    prep.add_argument("--direction", required=True)
+    prep.add_argument("--output", required=True)
+    prep.add_argument("--clips")
+    prep.add_argument("--frames")
+    prep.add_argument("--reference")
+    prep.add_argument("--lock-reference", action="store_true")
+    prep.add_argument("--provider", default="external")
+    prep.add_argument("--force", action="store_true")
+    status = clip_run.add_parser("status", help="show ready jobs and the smallest repair scope")
+    status.add_argument("--run", required=True)
+    accept = clip_run.add_parser("accept", help="copy a worker result into the run and inspect it")
+    accept.add_argument("--run", required=True)
+    accept.add_argument("--job", required=True)
+    accept.add_argument("--source")
+    accept.add_argument("--source-dir")
+    accept.add_argument("--frame", type=int)
+    accept.add_argument("--qa-note")
+    inspect = clip_run.add_parser("inspect", help="re-inspect accepted jobs and refresh parent QA")
+    inspect.add_argument("--run", required=True)
+    repair = clip_run.add_parser("repair", help="print the smallest failing generation scope")
+    repair.add_argument("--run", required=True)
+
+    p = sub.add_parser(
+        "vision-import",
+        help="stage external vision-model layers and render them through the local rig",
+    )
+    p.add_argument("--layers", required=True, help="directory containing model-produced RGBA PNG layers")
+    p.add_argument("--mapping", required=True, help="JSON mapping of AssetForge slots to layer filenames")
+    p.add_argument("--output", required=True, help="build directory")
+    p.add_argument("--archetype", choices=archetypes(), required=True)
+    p.add_argument("--character", required=True)
+    p.add_argument("--direction", default="east")
+    p.add_argument("--clips")
+    p.add_argument("--frames")
+    p.add_argument("--height", type=int, default=192)
+    p.add_argument("--resample", choices=("nearest", "bicubic"), default="nearest")
+    p.add_argument("--profile")
+    p.add_argument("--tier")
+    p.add_argument("--resource-prefix")
+    p.add_argument("--deploy-dir")
+
+    p = sub.add_parser(
+        "auto-decompose",
+        help="build a deterministic no-touch coarse rig from an existing frame tree",
+    )
+    p.add_argument("--frames", required=True, help="directory containing reference and/or animation PNGs")
+    p.add_argument("--output", required=True)
+    p.add_argument("--archetype", choices=archetypes(), required=True)
+    p.add_argument("--character", required=True)
+    p.add_argument("--direction", default="east")
+    p.add_argument("--clips")
+    p.add_argument("--height", type=int, default=192)
+    p.add_argument("--resample", choices=("nearest", "bicubic"), default="nearest")
 
     p = sub.add_parser("doctor", help="check profile, project, provider and toolchain readiness")
     p.add_argument("--profile", required=True)
@@ -622,6 +703,89 @@ def main(argv: list[str] | None = None) -> int:
                 minimum_free_gib=args.minimum_free_gib,
                 overwrite=args.overwrite,
             )
+            emit(result)
+            return 0 if result.get("ok") else 1
+        if args.command == "auto-decompose":
+            result = auto_decompose(
+                args.frames,
+                args.output,
+                archetype=args.archetype,
+                character=args.character,
+                direction=args.direction,
+                clips=(parse_clips(args.clips) if args.clips is not None else None),
+                height=args.height,
+                resample=args.resample,
+            )
+            emit(result)
+            return 0 if result.get("ok") else 1
+        if args.command == "vision-import":
+            output = Path(args.output).expanduser().resolve()
+            parts_dir = output / "vision-parts"
+            staged = stage_vision_layers(
+                args.layers,
+                args.mapping,
+                parts_dir,
+                archetype=args.archetype,
+            )
+            result = run_local_animation(
+                work_dir=output,
+                character=args.character,
+                direction=args.direction,
+                clips=(parse_clips(args.clips) if args.clips is not None else None),
+                frame_overrides=parse_frame_counts(args.frames),
+                parts_dir=parts_dir,
+                archetype=args.archetype,
+                height=args.height,
+                resample=args.resample,
+                profile_name=args.profile,
+                tier=args.tier,
+                resource_prefix=args.resource_prefix,
+                deploy_dir=args.deploy_dir,
+            )
+            result["visionImport"] = staged
+            emit(result)
+            return 0 if result.get("ok") else 1
+        if args.command == "multi-consensus":
+            result = multi_consensus(
+                args.frames,
+                args.output,
+                clip=args.clip,
+                change_threshold=args.change_threshold,
+                min_component=args.min_component,
+            )
+            emit(result)
+            return 0 if result.get("ok") else 1
+        if args.command == "clip-run":
+            if args.clip_run_command == "prepare":
+                result = prepare_clip_run(
+                    load_profile(args.profile),
+                    character=args.character,
+                    tier=args.tier,
+                    direction=args.direction,
+                    output=args.output,
+                    clips=args.clips,
+                    frames=args.frames,
+                    reference=args.reference,
+                    lock_reference=args.lock_reference,
+                    provider=args.provider,
+                    force=args.force,
+                )
+            elif args.clip_run_command == "status":
+                result = clip_run_status(args.run)
+            elif args.clip_run_command == "accept":
+                result = accept_job(
+                    load_clip_run(args.run),
+                    args.job,
+                    source=args.source,
+                    source_dir=args.source_dir,
+                    frame=args.frame,
+                    qa_note=args.qa_note,
+                )
+            elif args.clip_run_command == "inspect":
+                result = inspect_clip_run(args.run)
+            else:
+                result = repair_plan(load_clip_run(args.run))
+                result = {"ok": True, **result}
             emit(result)
             return 0 if result.get("ok") else 1
         if args.command == "redraw-quality":

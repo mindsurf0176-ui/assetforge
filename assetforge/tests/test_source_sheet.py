@@ -10,6 +10,7 @@ from assetforge.frames import (
     harden_alpha,
     infer_source_sheet_anchors,
     remove_chroma_background,
+    remove_checkerboard_background,
     remove_sheet_separator_lines,
     split_source_sheet,
 )
@@ -99,3 +100,30 @@ class SourceSheetTests(unittest.TestCase):
         hardened = harden_alpha(image, 20)
 
         self.assertEqual([hardened.getpixel((x, 0))[3] for x in range(3)], [0, 255, 255])
+
+    def test_checkerboard_background_is_keyed_including_enclosed_tiles(self) -> None:
+        image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        pixels = image.load()
+        for y in range(64):
+            for x in range(64):
+                even = ((x // 16) + (y // 16)) % 2 == 0
+                pixels[x, y] = (253, 253, 253, 255) if even else (246, 246, 246, 255)
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((20, 20, 43, 43), fill=(40, 80, 180, 255))
+        draw.rectangle((28, 28, 35, 35), fill=(253, 253, 253, 255))
+
+        cleaned = remove_checkerboard_background(image)
+
+        self.assertEqual(cleaned.getpixel((0, 0))[3], 0)
+        self.assertEqual(cleaned.getpixel((16, 0))[3], 0)
+        self.assertEqual(cleaned.getpixel((20, 20))[:3], (40, 80, 180))
+        self.assertGreater(cleaned.getpixel((30, 30))[3], 20)
+
+    def test_checkerboard_pass_ignores_uniform_green_key(self) -> None:
+        image = Image.new("RGBA", (32, 32), (0, 255, 0, 255))
+        ImageDraw.Draw(image).rectangle((8, 8, 23, 23), fill=(40, 80, 180, 255))
+
+        cleaned = remove_checkerboard_background(image)
+
+        self.assertEqual(cleaned.getpixel((0, 0)), (0, 255, 0, 255))
+        self.assertEqual(cleaned.getpixel((10, 10)), (40, 80, 180, 255))

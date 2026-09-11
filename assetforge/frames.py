@@ -91,10 +91,11 @@ def split_source_sheet(
         top = row * height // rows + crop_top
         bottom = min(height, top + cell_height)
         cropped = opened.crop((left, top, right, bottom))
-        cleaned = remove_chroma_background(cropped, 42)
+        cleaned = remove_chroma_background(remove_checkerboard_background(cropped), 42)
         cleaned = remove_neutral_foreground_fringe(
             remove_neutral_edge_halo(remove_corner_background(cleaned, 42))
         )
+        cleaned = remove_light_edge_matte(cleaned)
         cleaned = remove_sheet_separator_lines(cleaned)
         cleaned = harden_alpha(cleaned, 20)
         cleaned = keep_nearby_components(cleaned, max_component_gap, 20)
@@ -198,6 +199,125 @@ def alpha_bbox(image: Image.Image, min_alpha: int) -> tuple[int, int, int, int] 
     if not len(xs):
         return None
     return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def _rgb_luma(rgb: np.ndarray) -> np.ndarray:
+    return 0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]
+
+
+def _detect_checkerboard_period(
+    rgb: np.ndarray,
+    light: np.ndarray,
+    periods: tuple[int, ...] = (8, 16),
+) -> tuple[int, np.ndarray, np.ndarray] | None:
+    """Return (period, even-tile mean, odd-tile mean) when a light checker exists."""
+
+    height, width = light.shape
+    best: tuple[float, int, np.ndarray, np.ndarray] | None = None
+    for period in periods:
+        if height < period * 2 or width < period * 2:
+            continue
+        tile_means: dict[tuple[int, int], np.ndarray] = {}
+        tiles_y = height // period
+        tiles_x = width // period
+        for tile_y in range(tiles_y):
+            for tile_x in range(tiles_x):
+                y0 = tile_y * period
+                x0 = tile_x * period
+                tile_light = light[y0 : y0 + period, x0 : x0 + period]
+                if float(tile_light.mean()) < 0.9:
+                    continue
+                tile_means[(tile_y, tile_x)] = rgb[y0 : y0 + period, x0 : x0 + period][tile_light].mean(axis=0)
+        pairs: list[tuple[float, np.ndarray, np.ndarray, bool]] = []
+        for tile_y, tile_x in tile_means:
+            neighbor = tile_means.get((tile_y, tile_x + 1))
+            if neighbor is None:
+                continue
+            current = tile_means[(tile_y, tile_x)]
+            delta = float(np.abs(current - neighbor).sum())
+            if delta < 4.0 or delta > 90.0:
+                continue
+            pairs.append((delta, current, neighbor, (tile_y + tile_x) % 2 == 0))
+        if len(pairs) < 3:
+            continue
+        contrast, current, neighbor, even_first = max(pairs, key=lambda item: item[0])
+        even_mean = current if even_first else neighbor
+        odd_mean = neighbor if even_first else current
+        score = contrast * len(pairs)
+        if best is None or score > best[0]:
+            best = (score, period, even_mean, odd_mean)
+    if best is None:
+        return None
+    return best[1], best[2], best[3]
+
+
+def remove_checkerboard_background(
+    image: Image.Image,
+    *,
+    min_alpha: int = 20,
+    min_luma: float = 220.0,
+    max_channel_spread: int = 6,
+    max_color_distance: int = 18,
+) -> Image.Image:
+    """Key a baked Photoshop-style checkerboard, including enclosed tiles.
+
+    Image generators often flatten the light 8px/16px transparency preview into
+    an opaque PNG. Edge flood-fill cannot reach checker tiles trapped inside
+    hair or ribbon loops. This pass only runs when an alternating light period
+    is detected, keys near-achromatic checker pixels, and fills the leftover
+    interior pockets so the zero-hole gate can pass without being relaxed.
+    """
+
+    rgba = np.asarray(image.convert("RGBA")).copy()
+    rgb = rgba[:, :, :3].astype(np.float32)
+    opaque = rgba[:, :, 3] > min_alpha
+    if not opaque.any():
+        return Image.fromarray(rgba)
+    spread = rgb.max(axis=2) - rgb.min(axis=2)
+    luma = _rgb_luma(rgb)
+    light = opaque & (spread <= max_channel_spread) & (luma >= min_luma)
+    detected = _detect_checkerboard_period(rgb, light)
+    if detected is None:
+        return Image.fromarray(rgba)
+    period, even_mean, odd_mean = detected
+    height, width = light.shape
+    tiles_y = height // period
+    tiles_x = width // period
+    keyed = np.zeros(light.shape, dtype=bool)
+    for tile_y in range(tiles_y):
+        for tile_x in range(tiles_x):
+            y0 = tile_y * period
+            x0 = tile_x * period
+            tile_light = light[y0 : y0 + period, x0 : x0 + period]
+            if tile_light.size == 0 or float(tile_light.mean()) < 0.72:
+                continue
+            keyed[y0 : y0 + period, x0 : x0 + period] |= tile_light
+
+    even_distance = np.abs(rgb - even_mean).sum(axis=2)
+    odd_distance = np.abs(rgb - odd_mean).sum(axis=2)
+    matches_checker = light & ((even_distance <= max_color_distance) | (odd_distance <= max_color_distance))
+    pending: deque[tuple[int, int]] = deque()
+    visited = keyed.copy()
+    for y, x in zip(*np.nonzero(keyed)):
+        pending.append((int(y), int(x)))
+    neighbours = ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1))
+    while pending:
+        y, x = pending.popleft()
+        for dy, dx in neighbours:
+            next_y, next_x = y + dy, x + dx
+            if (
+                0 <= next_y < height
+                and 0 <= next_x < width
+                and matches_checker[next_y, next_x]
+                and not visited[next_y, next_x]
+            ):
+                visited[next_y, next_x] = True
+                keyed[next_y, next_x] = True
+                pending.append((next_y, next_x))
+
+    rgba[keyed, 3] = 0
+    cleaned = Image.fromarray(rgba)
+    return repair_small_enclosed_transparent_components(cleaned, 4096, min_alpha)
 
 
 def remove_chroma_background(image: Image.Image, tolerance: int = 42) -> Image.Image:
@@ -313,6 +433,52 @@ def remove_corner_background(image: Image.Image, tolerance: int) -> Image.Image:
                 queue.append((next_y, next_x))
 
     rgba[connected, 3] = 0
+    return Image.fromarray(rgba)
+
+
+def remove_light_edge_matte(
+    image: Image.Image,
+    *,
+    min_alpha: int = 20,
+    min_luma: float = 198.0,
+    max_channel_spread: int = 24,
+    max_layers: int = 1,
+) -> Image.Image:
+    """Erase one outer ring of leftover checkerboard/gray matte.
+
+    Generated sheets often keep a 205-230 gray rim after the 235-white halo
+    pass. Only pixels that both touch transparency and stay near-achromatic are
+    removed, so authored silver hair and white scarf interiors remain.
+    """
+
+    if max_layers < 0:
+        raise ValueError("max_layers must be non-negative")
+    rgba = np.asarray(image.convert("RGBA")).copy()
+    for _ in range(max_layers):
+        opaque = rgba[:, :, 3] > min_alpha
+        if not opaque.any():
+            break
+        rgb = rgba[:, :, :3].astype(np.float32)
+        spread = rgb.max(axis=2) - rgb.min(axis=2)
+        luma = _rgb_luma(rgb)
+        height, width = opaque.shape
+        transparent = ~opaque
+        touches_transparent = np.zeros_like(opaque)
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if not (dy or dx):
+                    continue
+                shifted = np.zeros_like(opaque)
+                ys = slice(max(0, dy), min(height, height + dy))
+                xs = slice(max(0, dx), min(width, width + dx))
+                source_ys = slice(max(0, -dy), min(height, height - dy))
+                source_xs = slice(max(0, -dx), min(width, width - dx))
+                shifted[ys, xs] = transparent[source_ys, source_xs]
+                touches_transparent |= shifted
+        matte = opaque & touches_transparent & (spread <= max_channel_spread) & (luma >= min_luma)
+        if not matte.any():
+            break
+        rgba[matte, 3] = 0
     return Image.fromarray(rgba)
 
 
@@ -486,6 +652,111 @@ def remove_neutral_foreground_fringe(
                 updates.append((int(start_y), int(start_x), replacement))
         for y, x, replacement in updates:
             rgba[y, x, :3] = replacement
+    return Image.fromarray(rgba)
+
+
+def darken_bright_outer_silhouette(
+    image: Image.Image,
+    min_luma: int = 130,
+    max_channel_spread: int = 55,
+    min_alpha: int = 20,
+) -> Image.Image:
+    """Replace pale outer-silhouette pixels with the nearest dark material.
+
+    This is deliberately narrower than general matte removal: it only affects
+    low-saturation bright pixels directly touching transparency.  Interior
+    silver trim and cyan emitters are left intact, while a cutout's pale rim
+    becomes an authored game-sprite outline.
+    """
+
+    rgba = np.asarray(image.convert("RGBA")).copy()
+    opaque = rgba[:, :, 3] > min_alpha
+    if not opaque.any():
+        return Image.fromarray(rgba)
+    height, width = opaque.shape
+    transparent = ~opaque
+    touches_transparent = np.zeros_like(opaque)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if not (dy or dx):
+                continue
+            shifted = np.zeros_like(opaque)
+            ys = slice(max(0, dy), min(height, height + dy))
+            xs = slice(max(0, dx), min(width, width + dx))
+            source_ys = slice(max(0, -dy), min(height, height - dy))
+            source_xs = slice(max(0, -dx), min(width, width - dx))
+            shifted[ys, xs] = transparent[source_ys, source_xs]
+            touches_transparent |= shifted
+    rgb = rgba[:, :, :3]
+    luma = (
+        rgb[:, :, 0].astype(np.int32) * 299
+        + rgb[:, :, 1].astype(np.int32) * 587
+        + rgb[:, :, 2].astype(np.int32) * 114
+    ) // 1000
+    pale = (luma >= min_luma) & ((rgb.max(axis=2) - rgb.min(axis=2)) <= max_channel_spread)
+    fringe = opaque & touches_transparent & pale
+    updates: list[tuple[int, int, tuple[int, int, int]]] = []
+    for y, x in zip(*np.nonzero(fringe)):
+        candidates: list[tuple[int, tuple[int, int, int]]] = []
+        for distance in range(1, 5):
+            for next_y in range(max(0, y - distance), min(height, y + distance + 1)):
+                for next_x in range(max(0, x - distance), min(width, x + distance + 1)):
+                    if max(abs(next_y - y), abs(next_x - x)) != distance or not opaque[next_y, next_x]:
+                        continue
+                    if pale[next_y, next_x]:
+                        continue
+                    color = tuple(int(value) for value in rgb[next_y, next_x])
+                    candidates.append((int(luma[next_y, next_x]), color))
+            if candidates:
+                updates.append((int(y), int(x), min(candidates, key=lambda item: item[0])[1]))
+                break
+    for y, x, replacement in updates:
+        rgba[y, x, :3] = replacement
+    return Image.fromarray(rgba)
+
+
+def clear_bright_connected_component(
+    image: Image.Image,
+    seed: tuple[int, int],
+    min_rgb: int = 190,
+    max_channel_spread: int = 55,
+    min_alpha: int = 20,
+) -> Image.Image:
+    """Clear one manually verified pale matte island selected by pixel seed.
+
+    Unlike automatic halo cleanup this never guesses at authored highlights:
+    callers must supply a seed in the specific disconnected background island.
+    """
+
+    rgba = np.asarray(image.convert("RGBA")).copy()
+    height, width = rgba.shape[:2]
+    x, y = seed
+    if not (0 <= x < width and 0 <= y < height):
+        raise ValueError("seed must be inside the image")
+    rgb = rgba[:, :, :3]
+    candidate = (
+        (rgba[:, :, 3] > min_alpha)
+        & (rgb.min(axis=2) >= min_rgb)
+        & ((rgb.max(axis=2) - rgb.min(axis=2)) <= max_channel_spread)
+    )
+    if not candidate[y, x]:
+        raise ValueError("seed must target a bright low-saturation opaque pixel")
+    component = np.zeros_like(candidate)
+    frontier = [(y, x)]
+    component[y, x] = True
+    while frontier:
+        current_y, current_x = frontier.pop()
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            next_y, next_x = current_y + dy, current_x + dx
+            if (
+                0 <= next_y < height
+                and 0 <= next_x < width
+                and candidate[next_y, next_x]
+                and not component[next_y, next_x]
+            ):
+                component[next_y, next_x] = True
+                frontier.append((next_y, next_x))
+    rgba[component, 3] = 0
     return Image.fromarray(rgba)
 
 
@@ -919,7 +1190,9 @@ def ingest_frames(
 
     prepared: list[Image.Image] = []
     for path in sources:
-        image = remove_neutral_edge_halo(remove_corner_background(Image.open(path), tolerance))
+        image = remove_neutral_edge_halo(
+            remove_corner_background(remove_checkerboard_background(Image.open(path)), tolerance)
+        )
         if edge_matte_mode == "remove-neutral":
             image = remove_neutral_foreground_fringe(
                 image,
@@ -1097,6 +1370,13 @@ def ingest_frames(
                     max_gap_rows=bottom_line_gap,
                     min_alpha=min_alpha,
                 )
+        canvas = remove_light_edge_matte(canvas, min_alpha=min_alpha)
+        if allow_source_resize:
+            canvas = repair_small_enclosed_transparent_components(
+                canvas,
+                max(max_repair_pixels, 64),
+                min_alpha,
+            )
         path = safe_output_child(
             output,
             f"{animation}_{index:0{digits}d}.png",

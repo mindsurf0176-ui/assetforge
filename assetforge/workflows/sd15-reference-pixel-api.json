@@ -45,7 +45,7 @@
     "class_type": "SaveImage",
     "inputs": {
       "filename_prefix": "assetforge/reference-pixel",
-      "images": ["8", 0]
+      "images": ["13", 0]
     }
   },
   "10": {
@@ -68,6 +68,16 @@
       "upscale_method": "nearest-exact",
       "width": "${WIDTH}",
       "height": "${HEIGHT}",
+      "crop": "disabled"
+    }
+  },
+  "13": {
+    "class_type": "ImageScale",
+    "inputs": {
+      "image": ["8", 0],
+      "upscale_method": "nearest-exact",
+      "width": "${PIXEL_WIDTH}",
+      "height": "${PIXEL_HEIGHT}",
       "crop": "disabled"
     }
   }
