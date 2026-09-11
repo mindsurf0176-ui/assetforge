@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Add identity-locked `clip-run` jobs: canonical base first, per-clip layout guides, guide-pixel fail, and frame-then-clip repair.
+- Add `auto-decompose`, `vision-import`, and `multi-consensus` as coarse/review-only local ingest tools.
+- Remove checkerboard backgrounds and light edge mattes during source-sheet ingest.
+- Downscale SD1.5 ComfyUI reference output with nearest-exact pixel-grid postprocess.
+
 ## 0.6.0 - 2026-08-31
 
 - Add the provider-independent `pipeline` command for one-shot sheet/frame

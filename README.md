@@ -31,6 +31,7 @@ It is designed to replace the repeatable sprite-animation and delivery portion o
 - Fail-closed FLUX.2 edit planning and execution through MFLUX on Apple Silicon, with local-weight, LoRA, disk, input-board, and output checks.
 - Character-held-out batch QC and atomic promotion of passing boards into native transparent sprite frames.
 - Gated MFLUX edit-LoRA training, checkpoint extraction, and local inference without a PixelLab or hosted generation call.
+- Identity-locked clip runs: canonical base first, per-clip layout guides, guide-pixel fail, frame-then-clip repair, and a parent contact-sheet QA protocol.
 
 ## Build a local full-frame redraw dataset
 
@@ -392,7 +393,72 @@ assetforge animate \
   --work build/creature-coarse
 ```
 
+## Import layers from an external vision model
+
+APES, See-through, or another segmentation backend can write transparent PNG
+layers without becoming a runtime dependency of AssetForge. The adapter keeps
+the model output outside the game tree, validates the semantic slots, then
+passes the result through the same deterministic rig and animation checks:
+
+```json
+{
+  "head": "layer_03.png",
+  "torso": "layer_07.png",
+  "arm_f": "layer_05.png",
+  "arm_b": "layer_04.png",
+  "leg_f": "layer_01.png",
+  "leg_b": "layer_02.png",
+  "weapon": "layer_08.png"
+}
+```
+
+```bash
+assetforge vision-import \
+  --layers build/vision-output/layers \
+  --mapping build/vision-output/assetforge-mapping.json \
+  --output build/warden-vision-rig \
+  --archetype biped-side \
+  --character warden \
+  --direction east \
+  --height 192 \
+  --resample nearest
+```
+
+The command fails on missing, empty, path-escaping, or unsupported layers. It
+does not silently invent semantic parts; missing back-side limbs can only be
+handled by the existing explicit mirror policy in the downstream rig command.
+
 The manifest reports `quality: "coarse"`, `occlusionSynthesis: false`, alpha reconstruction IoU, unscored semantic confidence, omitted regions, and warnings. Reconstruction IoU only proves that visible alpha was preserved; it does not prove that the automatic semantic split was correct. Inspect `rig/rig-overlay.png` and the generated contact sheet. Coarse output can be exported into an isolated review artifact, but `--deploy-dir` is blocked until separated production art is approved.
+
+## Build a deterministic no-touch coarse rig from frames
+
+When only rendered frames exist and the source art must not be touched, derive a coarse rig from the frame tree itself:
+
+```bash
+assetforge auto-decompose \
+  --frames build/creature-frames \
+  --output build/creature-auto-rig \
+  --archetype biped-side \
+  --character creature \
+  --direction east \
+  --height 192 \
+  --resample nearest
+```
+
+The command selects the largest-frame median-area reference, runs the existing `autorig_reference` plus walk 8-contact aim clip, and writes `auto-decompose-report.json` with `production: false`. It never synthesizes hidden pixels or occlusion; inspect `rig/rig-overlay.png` before downstream use.
+
+## Analyze stable motion regions across frames
+
+When a frame tree already exists, measure which regions stay stable before approving a rig or redraw:
+
+```bash
+assetforge multi-consensus \
+  --frames build/creature-frames \
+  --output build/creature-consensus \
+  --clip walk
+```
+
+The command requires at least three non-empty PNG frames, aligns per-clip anchors, and writes `multi-consensus-report.json` plus `motion-heatmap.png` and candidates. It is a read-only diagnostic with `production: false`; omit `--clip` to analyze every clip prefix.
 
 ## Build animation and redraw boards from one image
 
@@ -420,6 +486,31 @@ a ready local model, the command fails closed and preserves the boards. Redraw
 prompts require genuine transparent RGBA sprite backgrounds; the delivery path
 also removes border-connected white/gray matte pixels and hardens the remaining
 silhouette alpha so light fringes do not reach the game runtime.
+
+## Lock identity before opening clip jobs
+
+Full-frame generation is a job graph, not a whole-character sheet. Lock one canonical base, then open clip jobs that depend on it. Layout guides are construction drawings: if their pixels appear in a generated frame, that frame fails even when geometry validation is clean. Identity drift is also a blocker. Repair the smallest failing scope: frames, then the clip, then the canonical base.
+
+```bash
+assetforge clip-run prepare \
+  --profile art/characters/moa/moa-v27-profile.json \
+  --character moa \
+  --tier battle-candidate \
+  --direction east \
+  --reference art/moa-identity.png \
+  --lock-reference \
+  --output build/moa-clip-run
+```
+
+`--lock-reference` copies the supplied still into `references/canonical-base.png` and marks the `base` job complete, so `idle` becomes the first ready clip. Without it, only `base` is ready. Clip jobs after idle also wait for idle. Workers return only `selected_source` and `qa_note`; the parent inspects `qa/contact-sheet.png` and clip GIFs, not every generated PNG.
+
+```bash
+assetforge clip-run accept --run build/moa-clip-run --job idle --source decoded/idle.png --qa-note "idle matches the locked base"
+assetforge clip-run status --run build/moa-clip-run
+assetforge clip-run accept --run build/moa-clip-run --job walk --frame 3 --source decoded/walk-03.png
+```
+
+Passing `clip-run` inspection does not ingest, release, or connect Starline. Use `source-sheet` / `ingest` / `validate` on approved frames only.
 
 ## Ingest a generated source sheet with a fixed motion anchor
 

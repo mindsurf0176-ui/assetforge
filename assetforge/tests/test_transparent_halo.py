@@ -6,10 +6,38 @@ from assetforge.frames import (
     neutral_foreground_fringe_pixels,
     remove_neutral_edge_halo,
     remove_neutral_foreground_fringe,
+    remove_light_edge_matte,
+    darken_bright_outer_silhouette,
+    clear_bright_connected_component,
 )
 
 
 class TransparentHaloTests(unittest.TestCase):
+    def test_darkens_only_pale_outer_silhouette(self) -> None:
+        image = Image.new("RGBA", (9, 9), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((2, 2, 6, 6), fill=(35, 42, 58, 255))
+        draw.rectangle((2, 2, 6, 2), fill=(210, 212, 220, 255))
+        draw.point((4, 4), fill=(220, 222, 230, 255))
+        draw.point((2, 4), fill=(0, 232, 255, 255))
+
+        cleaned = darken_bright_outer_silhouette(image)
+
+        self.assertEqual(cleaned.getpixel((4, 2)), (35, 42, 58, 255))
+        self.assertEqual(cleaned.getpixel((4, 4)), (220, 222, 230, 255))
+        self.assertEqual(cleaned.getpixel((2, 4)), (0, 232, 255, 255))
+
+    def test_clears_only_seeded_bright_component(self) -> None:
+        image = Image.new("RGBA", (11, 11), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((2, 2, 4, 4), fill=(215, 216, 222, 255))
+        draw.rectangle((7, 7, 8, 8), fill=(215, 216, 222, 255))
+
+        cleaned = clear_bright_connected_component(image, (3, 3))
+
+        self.assertEqual(cleaned.getpixel((3, 3))[3], 0)
+        self.assertEqual(cleaned.getpixel((7, 7)), (215, 216, 222, 255))
+
     def test_removes_attached_neutral_foreground_fringe_layers(self) -> None:
         image = Image.new("RGBA", (13, 13), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
@@ -57,3 +85,16 @@ class TransparentHaloTests(unittest.TestCase):
 
         self.assertEqual(cleaned.getpixel((0, 3))[3], 0)
         self.assertEqual(cleaned.getpixel((3, 3)), (45, 50, 58, 255))
+
+    def test_removes_mid_gray_checkerboard_rim_without_eating_interior_white(self) -> None:
+        image = Image.new("RGBA", (11, 11), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((2, 2, 8, 8), fill=(210, 210, 212, 255))
+        draw.rectangle((4, 4, 6, 6), fill=(40, 70, 160, 255))
+        draw.point((5, 5), fill=(248, 248, 248, 255))
+
+        cleaned = remove_light_edge_matte(image)
+
+        self.assertEqual(cleaned.getpixel((2, 5))[3], 0)
+        self.assertEqual(cleaned.getpixel((5, 5)), (248, 248, 248, 255))
+        self.assertEqual(cleaned.getpixel((5, 4)), (40, 70, 160, 255))
